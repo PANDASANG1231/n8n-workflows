@@ -1,0 +1,138 @@
+{
+  "id": "bDaG756WyaOmZbdV",
+  "name": "YouTube Video Summarizer",
+  "active": false,
+  "nodes": [
+    {
+      "id": "a1b2c3d4-0001-4000-8000-000000000001",
+      "parameters": {},
+      "name": "Manual Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [0, 0]
+    },
+    {
+      "id": "a1b2c3d4-0002-4000-8000-000000000002",
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// ===== Configuration =====\nconst config = {\n  search_query: 'n8n automation tutorial',\n  youtube_api_key: 'AIzaSyDiUqjjch7d0TvAGlLq61RdjrJspvGVBuM',\n  gemini_api_key: 'AIzaSyA_ouLgSmDlVoTp5JylSaht7FnHxnnICG0',\n  output_dir: '/data/summaries',\n  sub_lang: 'en',\n  max_results: 1\n};\n\nreturn [{ json: config }];"
+      },
+      "name": "Config",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [220, 0]
+    },
+    {
+      "id": "a1b2c3d4-0003-4000-8000-000000000003",
+      "parameters": {
+        "method": "GET",
+        "url": "=https://www.googleapis.com/youtube/v3/search?part=snippet&q={{ encodeURIComponent($json.search_query) }}&type=video&maxResults={{ $json.max_results }}&key={{ $json.youtube_api_key }}",
+        "options": {}
+      },
+      "name": "YouTube Search",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [440, 0]
+    },
+    {
+      "id": "a1b2c3d4-0004-4000-8000-000000000004",
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const response = $input.first().json;\nconst config = $('Config').first().json;\n\nif (!response.items || response.items.length === 0) {\n  throw new Error('No videos found for query: ' + config.search_query);\n}\n\nreturn response.items.map(item => ({\n  json: {\n    videoId: item.id.videoId,\n    title: item.snippet.title,\n    channelTitle: item.snippet.channelTitle,\n    publishedAt: item.snippet.publishedAt,\n    description: item.snippet.description,\n    gemini_api_key: config.gemini_api_key,\n    output_dir: config.output_dir,\n    sub_lang: config.sub_lang\n  }\n}));"
+      },
+      "name": "Extract Video Info",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [660, 0]
+    },
+    {
+      "id": "a1b2c3d4-0005-4000-8000-000000000005",
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const { execSync } = require('child_process');\n\nconst videoId = $json.videoId;\nconst subLang = $json.sub_lang || 'en';\nconst url = `https://www.youtube.com/watch?v=${videoId}`;\n\n// Clean up any previous files\ntry { execSync(`rm -f /tmp/yt_sub_${videoId}.*`, { encoding: 'utf-8' }); } catch(e) {}\n\n// Download subtitles with yt-dlp\ntry {\n  execSync(\n    `yt-dlp --write-auto-sub --write-sub --sub-lang ${subLang} --skip-download --sub-format vtt -o \"/tmp/yt_sub_${videoId}\" \"${url}\"`,\n    { encoding: 'utf-8', timeout: 30000 }\n  );\n} catch (e) {\n  throw new Error('yt-dlp failed: ' + (e.stderr || e.message));\n}\n\n// Read the subtitle file\nlet vttContent = '';\ntry {\n  const files = execSync(`ls /tmp/yt_sub_${videoId}.*.vtt 2>/dev/null`, { encoding: 'utf-8' }).trim();\n  if (files) {\n    vttContent = execSync(`cat ${files.split('\\n')[0]}`, { encoding: 'utf-8' });\n  }\n} catch (e) {\n  throw new Error('No subtitle file found for video: ' + videoId);\n}\n\n// Clean up temp files\ntry { execSync(`rm -f /tmp/yt_sub_${videoId}.*`, { encoding: 'utf-8' }); } catch(e) {}\n\nif (!vttContent.trim()) {\n  throw new Error('Empty subtitle content for video: ' + videoId);\n}\n\nreturn {\n  json: {\n    stdout: vttContent\n  }\n};"
+      },
+      "name": "yt-dlp Get Subtitles",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [880, 0]
+    },
+    {
+      "id": "a1b2c3d4-0006-4000-8000-000000000006",
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const stdout = $json.stdout || '';\nconst videoInfo = $('Extract Video Info').first().json;\n\n// Clean VTT format to plain text\nconst lines = stdout.split('\\n');\nconst textLines = [];\nconst seen = new Set();\n\nfor (const line of lines) {\n  const trimmed = line.trim();\n  if (!trimmed) continue;\n  if (trimmed.startsWith('WEBVTT')) continue;\n  if (trimmed.startsWith('Kind:')) continue;\n  if (trimmed.startsWith('Language:')) continue;\n  if (trimmed.startsWith('NOTE')) continue;\n  if (/^\\d+$/.test(trimmed)) continue;\n  if (/\\d{2}:\\d{2}[:\\.]\\d{2}/.test(trimmed) && trimmed.includes('-->')) continue;\n\n  const cleaned = trimmed.replace(/<[^>]+>/g, '').trim();\n  if (!cleaned) continue;\n\n  if (!seen.has(cleaned)) {\n    seen.add(cleaned);\n    textLines.push(cleaned);\n  }\n}\n\nconst transcript = textLines.join('\\n');\n\nif (!transcript) {\n  throw new Error('No subtitles found for video: ' + videoInfo.videoId);\n}\n\n// Prepare Gemini request body\nconst prompt = `You are a professional content summarizer. Summarize the following YouTube video transcript into a well-structured markdown document.\n\nRequirements:\n- Start with a title (# Title)\n- Add video metadata (channel, date)\n- Write a brief overview (2-3 sentences)\n- List key points/takeaways as bullet points\n- Include important details or examples\n- End with a conclusion\n- Write in the same language as the transcript\n\nVideo Title: ${videoInfo.title}\nChannel: ${videoInfo.channelTitle}\nPublished: ${videoInfo.publishedAt}\n\nTranscript:\n${transcript.substring(0, 30000)}`;\n\nconst geminiBody = {\n  contents: [{ parts: [{ text: prompt }] }],\n  generationConfig: { temperature: 0.3, maxOutputTokens: 4096 }\n};\n\nreturn {\n  json: {\n    transcript,\n    geminiBody,\n    videoId: videoInfo.videoId,\n    title: videoInfo.title,\n    channelTitle: videoInfo.channelTitle,\n    publishedAt: videoInfo.publishedAt,\n    gemini_api_key: videoInfo.gemini_api_key,\n    output_dir: videoInfo.output_dir\n  }\n};"
+      },
+      "name": "Clean and Prepare",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1100, 0]
+    },
+    {
+      "id": "a1b2c3d4-0007-4000-8000-000000000007",
+      "parameters": {
+        "method": "POST",
+        "url": "=https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={{ $json.gemini_api_key }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.geminiBody) }}",
+        "options": {}
+      },
+      "name": "Gemini Summarize",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [1320, 0]
+    },
+    {
+      "id": "a1b2c3d4-0008-4000-8000-000000000008",
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const response = $json;\nconst videoInfo = $('Clean and Prepare').first().json;\n\nconst summary = response.candidates?.[0]?.content?.parts?.[0]?.text || 'Summary generation failed.';\n\nconst markdown = summary + '\\n\\n---\\n\\n' +\n  '> Source: [YouTube](https://www.youtube.com/watch?v=' + videoInfo.videoId + ')  \\n' +\n  '> Channel: ' + videoInfo.channelTitle + '  \\n' +\n  '> Generated: ' + DateTime.now().toFormat('yyyy-MM-dd HH:mm') + '\\n';\n\nconst binaryData = await this.helpers.prepareBinaryData(\n  Buffer.from(markdown, 'utf-8'),\n  videoInfo.videoId + '.md',\n  'text/markdown'\n);\n\nreturn {\n  json: {\n    videoId: videoInfo.videoId,\n    title: videoInfo.title,\n    output_dir: videoInfo.output_dir\n  },\n  binary: { data: binaryData }\n};"
+      },
+      "name": "Format Markdown",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1540, 0]
+    },
+    {
+      "id": "a1b2c3d4-0009-4000-8000-000000000009",
+      "parameters": {
+        "operation": "write",
+        "fileName": "={{ $json.output_dir }}/{{ $json.videoId }}.md",
+        "dataPropertyName": "data"
+      },
+      "name": "Save .md File",
+      "type": "n8n-nodes-base.readWriteFile",
+      "typeVersion": 1.1,
+      "position": [1760, 0]
+    }
+  ],
+  "connections": {
+    "Manual Trigger": {
+      "main": [[{ "node": "Config", "type": "main", "index": 0 }]]
+    },
+    "Config": {
+      "main": [[{ "node": "YouTube Search", "type": "main", "index": 0 }]]
+    },
+    "YouTube Search": {
+      "main": [[{ "node": "Extract Video Info", "type": "main", "index": 0 }]]
+    },
+    "Extract Video Info": {
+      "main": [[{ "node": "yt-dlp Get Subtitles", "type": "main", "index": 0 }]]
+    },
+    "yt-dlp Get Subtitles": {
+      "main": [[{ "node": "Clean and Prepare", "type": "main", "index": 0 }]]
+    },
+    "Clean and Prepare": {
+      "main": [[{ "node": "Gemini Summarize", "type": "main", "index": 0 }]]
+    },
+    "Gemini Summarize": {
+      "main": [[{ "node": "Format Markdown", "type": "main", "index": 0 }]]
+    },
+    "Format Markdown": {
+      "main": [[{ "node": "Save .md File", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}
